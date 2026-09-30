@@ -52,6 +52,20 @@ class InterlockBlockedError(MixPlantError):
     http_status = 409
 
 
+class RollbackBlockedError(MixPlantError):
+    """A stage rollback window currently forbids the action."""
+
+    code = "rollback_blocked"
+    http_status = 409
+
+
+class RollbackWindowError(MixPlantError):
+    """A rollback was opened twice, confirmed without one or given no reason."""
+
+    code = "rollback_window"
+    http_status = 409
+
+
 class ArtifactExpiredError(MixPlantError):
     """A confirmation, snapshot or baseline is past its validity window."""
 

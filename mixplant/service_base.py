@@ -85,6 +85,7 @@ class PlantService:
             facts=self.facts(**extra),
             machine=self.machine if required_phase is not None else None,
             required_phase=required_phase,
+            tick=self.context.clock.now(),
         )
 
     def advance(self, phase: str, reason: str) -> PhaseStep:

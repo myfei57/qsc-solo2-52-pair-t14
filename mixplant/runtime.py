@@ -33,9 +33,16 @@ from .plant.tools import integer, number, optional_integer, optional_number, opt
 from .pump.service import PumpService
 from .recipe.recipe import Recipe
 from .recipe.service import RecipeService
+from .rollback import (
+    ROLLBACK_BLOCK_KIND,
+    ROLLBACK_CONFIRM_KIND,
+    ROLLBACK_KIND,
+    RollbackCoordinator,
+)
 from .sampler.service import SamplerService
 from .service_base import PlantService
 from .statemachine.gate import PreGate
+from .statemachine.guard import RollbackGuard
 from .statemachine.machine import SequenceMachine
 from .statemachine.phases import LINE_SEQUENCES
 from .store.repository import RecordRepository, RestoreReport
@@ -88,6 +95,7 @@ class PlantRuntime:
         self.audit_subscriber = AuditSubscriber(self.store)
         self.alarms = AlarmCollector()
         self.machines = {line: SequenceMachine(line) for line in LINES}
+        self.rollback_guard = RollbackGuard(LINES)
         self.context = SharedContext(
             store=self.store,
             versions=self.versions,
@@ -110,6 +118,16 @@ class PlantRuntime:
         self.pump = PumpService(self.context, self.machines["delivery"])
         self.sampler = SamplerService(self.context, self.recipes, self.machines["delivery"])
         self.audit = AuditService(self.context, self.machines["batch"], alarms=self.alarms)
+        self.gate.bind_rollback(self.rollback_guard)
+        self.rollbacks = RollbackCoordinator(
+            self.machines,
+            self.rollback_guard,
+            store=self.store,
+            audit=self.audit,
+            ids=self.ids,
+            clock=self.clock,
+            bus=self.bus,
+        )
         self.controller = PlantController(self)
         self.boot_report: RestoreReport | None = None
         self._services: dict[str, PlantService] = {
@@ -146,6 +164,7 @@ class PlantRuntime:
         self._restore_id_counters()
         self._adopt_records()
         self._hydrate_machines()
+        self._hydrate_rollbacks()
         self.store.publish(
             BOOT_KIND,
             "console",
@@ -241,6 +260,15 @@ class PlantRuntime:
                 tick=record.tick,
             )
 
+    def _hydrate_rollbacks(self) -> None:
+        """Rebuild open rollback windows and their ordered block history."""
+
+        kinds = (ROLLBACK_KIND, ROLLBACK_BLOCK_KIND, ROLLBACK_CONFIRM_KIND)
+        records = tuple(record for record in self.store.visible() if record.kind in kinds)
+        self.rollbacks.replay(records)
+        rollbacks = sum(1 for record in records if record.kind == ROLLBACK_KIND)
+        self.ids.restore("rb", rollbacks)
+
     def health(self) -> dict[str, Any]:
         """Return the values a health probe needs."""
 
@@ -254,6 +282,9 @@ class PlantRuntime:
             "batches": self.batches.count(),
             "alarms": self.alarms.count(),
             "lines": {line: machine.phase for line, machine in self.machines.items()},
+            "rollback_open": {
+                line: window is not None for line, window in self.rollback_guard.describe()["lines"].items()
+            },
             "latched": {"sampler": self.sampler.latch.latched},
         }
 
@@ -272,9 +303,14 @@ class PlantRuntime:
                     "sequence": machine.order(),
                     "next": machine.next_phase(),
                     "last_step": machine.last_step.describe(),
+                    "rollback_window": self.rollback_guard.window(line).describe(),
+                    "rollback_history": [
+                        event.describe() for event in self.rollback_guard.window(line).history()
+                    ],
                 }
                 for line, machine in self.machines.items()
             },
+            rollback=self.rollbacks.status(),
             versioned=self.versions.describe(now),
             thresholds=self.thresholds.describe(),
             interlocks={
@@ -368,6 +404,16 @@ class PlantRuntime:
             ],
             "watermark": self.store.watermark().describe(),
         }
+
+    def rollback_phase(self, line: str, *, reason: str) -> dict[str, Any]:
+        """Roll one line back to its previous stable stage and open a window."""
+
+        return self.rollbacks.rollback(line, reason)
+
+    def confirm_realignment(self, line: str, *, reason: str, confirmer: str = "operator") -> dict[str, Any]:
+        """Confirm the line is realigned so its rollback window can close."""
+
+        return self.rollbacks.confirm_realignment(line, reason, confirmer=confirmer)
 
     def advance_ticks(self, ticks: int = 1) -> int:
         """Move the deterministic clock forward and record where it went."""
@@ -479,6 +525,14 @@ class PlantRuntime:
             "store.rollback": lambda payload: self.rollback(
                 integer(payload, "seq"), reason=optional_text(payload, "reason", "operator rollback")
             ),
+            "rollback.phase": lambda payload: self.rollback_phase(
+                text(payload, "line"), reason=text(payload, "reason")
+            ),
+            "rollback.confirm": lambda payload: self.confirm_realignment(
+                text(payload, "line"),
+                reason=text(payload, "reason"),
+                confirmer=optional_text(payload, "confirmer", "operator"),
+            ),
             "clock.advance": lambda payload: {"tick": self.advance_ticks(integer(payload, "ticks"))},
         }
 
@@ -488,6 +542,7 @@ class PlantRuntime:
         handler = self.commands().get(command)
         if handler is None:
             raise NotFoundError("unknown command", command=command)
+        self._enforce_rollback_window(command)
         result = handler(payload or {})
         return {
             "command": command,
@@ -496,6 +551,40 @@ class PlantRuntime:
             "watermark": self.store.watermark().describe(),
             "alarms": self.alarms.count(),
         }
+
+    #: Commands that stay available while any rollback window is open. These
+    #: either control the rollback itself or are plant wide housekeeping.
+    ROLLBACK_EXEMPT_COMMANDS = frozenset(
+        {
+            "rollback.phase",
+            "rollback.confirm",
+            "audit.note",
+            "audit.rollup",
+            "clock.advance",
+            "snapshot.take",
+            "store.rollback",
+            "baseline.publish",
+            "confirmation.take",
+        }
+    )
+
+    def _enforce_rollback_window(self, command: str) -> None:
+        """Block the command at the single entry point, in arrival order."""
+
+        if command in self.ROLLBACK_EXEMPT_COMMANDS:
+            return
+        blocked = self.rollbacks.record_blocked_action(command)
+        if blocked is not None:
+            from .errors import RollbackBlockedError
+
+            raise RollbackBlockedError(
+                "action is blocked while the line is rolled back and awaiting realignment",
+                action=command,
+                line=blocked["line"],
+                target_phase=blocked["target_phase"],
+                scope=blocked["scope"],
+                rollback_id=blocked["rollback_id"],
+            )
 
     def close(self) -> None:
         self.store.close()

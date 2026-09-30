@@ -26,6 +26,19 @@
   <form id="drop"><button type="submit">drop</button></form>
   <p>targets <span class="flag" id="targets"></span></p>
   <table id="bins"><thead><tr><th>bin</th><th>material</th><th>target kg</th></tr></thead><tbody></tbody></table>
+  <h2>Stage rollback</h2>
+  <form id="rollback">
+    <select name="line"><option value="batch">batch</option><option value="mix">mix</option><option value="delivery">delivery</option></select>
+    <input name="reason" placeholder="rollback reason (required)" size="40">
+    <button type="submit">rollback to previous stable stage</button>
+  </form>
+  <form id="realign">
+    <select name="line"><option value="batch">batch</option><option value="mix">mix</option><option value="delivery">delivery</option></select>
+    <input name="confirmer" value="operator" size="10">
+    <input name="reason" placeholder="why it is realigned (required)" size="40">
+    <button type="submit">confirm realignment</button>
+  </form>
+  <div id="rollback-status"></div>
   <script id="plant-state" type="application/json"><!--STATE--></script>
   <script>
     const state = JSON.parse(document.getElementById('plant-state').textContent || '{}');
@@ -37,6 +50,16 @@
       row.innerHTML = `<td>${bin}</td><td>${(state.recipe.mapping?.assignments ?? {})[bin] ?? ''}</td><td>${kg}</td>`;
       body.appendChild(row);
     }
+    function renderRollback() {
+      const block = document.getElementById('rollback-status');
+      const lines = state.rollback?.lines || {};
+      block.innerHTML = Object.entries(lines).map(([line, info]) => {
+        if (!info.window) return `<p>${line}: <b>${info.phase}</b> (normal)</p>`;
+        const w = info.window;
+        return `<p>${line}: <b>${info.phase}</b> &mdash; rolled back from ${w.from_phase} to <b>${w.target_phase}</b> (${w.scope === 'all' ? 'all actions blocked' : 'related actions blocked'})<br>reason: ${w.reason}<br>blocked attempts: ${JSON.stringify(w.blocked_actions)}</p>`;
+      }).join('');
+    }
+    renderRollback();
     async function post(path, form) {
       const entries = form ? Object.fromEntries(new FormData(form).entries()) : {};
       const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entries) });
@@ -46,6 +69,18 @@
     for (const [id, path] of Object.entries(routes)) {
       document.getElementById(id).addEventListener('submit', async (event) => { event.preventDefault(); console.log(await post(path, event.target)); location.reload(); });
     }
+    document.getElementById('rollback').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const entries = Object.fromEntries(new FormData(event.target).entries());
+      await fetch(`/api/lines/${entries.line}/rollback`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: entries.reason }) });
+      location.reload();
+    });
+    document.getElementById('realign').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const entries = Object.fromEntries(new FormData(event.target).entries());
+      await fetch(`/api/lines/${entries.line}/realign`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: entries.reason, confirmer: entries.confirmer }) });
+      location.reload();
+    });
   </script>
 </body>
 </html>
