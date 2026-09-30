@@ -15,7 +15,7 @@ from .decision.batch import BatchRegistry
 from .decision.query import query_from_params, run_query
 from .decision.stateview import StateView
 from .decision.thresholds import ThresholdSet
-from .errors import NotFoundError
+from .errors import NotFoundError, RollbackFrozenError
 from .event.bus import Event, EventBus
 from .event.subscribers import AlarmCollector, AuditSubscriber
 from .event.topics import ALARM, STORE
@@ -33,11 +33,13 @@ from .plant.tools import integer, number, optional_integer, optional_number, opt
 from .pump.service import PumpService
 from .recipe.recipe import Recipe
 from .recipe.service import RecipeService
+from .rollback.policy import REALIGN_KIND, ROLLBACK_KIND, RollbackService
 from .sampler.service import SamplerService
 from .service_base import PlantService
 from .statemachine.gate import PreGate
 from .statemachine.machine import SequenceMachine
 from .statemachine.phases import LINE_SEQUENCES
+from .statemachine.rollback import RollbackRegistry
 from .store.repository import RecordRepository, RestoreReport
 from .versioning.expiry import Validity
 from .versioning.facade import VersionedArtifacts
@@ -81,7 +83,8 @@ class PlantRuntime:
         self.view = StateView(self.store)
         self.batches = BatchRegistry()
         self.engine = build_engine()
-        self.gate = PreGate(self.engine)
+        self.rollbacks = RollbackRegistry()
+        self.gate = PreGate(self.engine, self.rollbacks)
         self.bus = EventBus()
         self.topology = default_topology()
         self.registry = build_registry(self.topology, EXTRA_DEVICES)
@@ -110,6 +113,9 @@ class PlantRuntime:
         self.pump = PumpService(self.context, self.machines["delivery"])
         self.sampler = SamplerService(self.context, self.recipes, self.machines["delivery"])
         self.audit = AuditService(self.context, self.machines["batch"], alarms=self.alarms)
+        self.rollback_service = RollbackService(
+            self.context, self.rollbacks, self.machines, self.audit.ledger
+        )
         self.controller = PlantController(self)
         self.boot_report: RestoreReport | None = None
         self._services: dict[str, PlantService] = {
@@ -123,6 +129,7 @@ class PlantRuntime:
             "pump": self.pump,
             "sampler": self.sampler,
             "audit": self.audit,
+            "rollback": self.rollback_service,
         }
         self._wire_bus()
 
@@ -146,6 +153,7 @@ class PlantRuntime:
         self._restore_id_counters()
         self._adopt_records()
         self._hydrate_machines()
+        self._restore_rollbacks()
         self.store.publish(
             BOOT_KIND,
             "console",
@@ -241,6 +249,50 @@ class PlantRuntime:
                 tick=record.tick,
             )
 
+    def _restore_rollbacks(self) -> None:
+        """Rebuild open freezes and their blocked-action order from the stream."""
+
+        # Pass 1: reconstruct every episode and whether it is still open.
+        for record in self.store.visible():
+            if record.kind == ROLLBACK_KIND:
+                payload = record.payload
+                self.rollbacks.hydrate_open(
+                    rollback_id=str(payload.get("rollback_id", f"RB-{record.seq:04d}")),
+                    line=str(payload["line"]),
+                    from_phase=str(payload["from_phase"]),
+                    to_phase=str(payload["to_phase"]),
+                    scope=str(payload["scope"]),
+                    reason=str(payload["reason"]),
+                    opened_tick=record.tick,
+                    opened_seq=record.seq,
+                )
+            elif record.kind == REALIGN_KIND:
+                payload = record.payload
+                self.rollbacks.hydrate_close(
+                    line=str(payload["line"]),
+                    tick=record.tick,
+                    seq=record.seq,
+                    confirmed_by=str(payload.get("confirmed_by", "")),
+                    note=(str(payload["note"]) if payload.get("note") else None),
+                )
+        # Pass 2: blocked attempts are appended in stream order, attached to the
+        # episode named on the record.  Walking ``visible()`` preserves the tick
+        # sequence even across episodes that have since been realigned.
+        for record in self.store.visible():
+            if record.kind != "audit.rollback_blocked":
+                continue
+            detail = record.payload.get("detail")
+            if not isinstance(detail, Mapping) or "action" not in detail:
+                continue
+            self.rollbacks.attach_blocked(
+                rollback_id=str(detail["rollback_id"]),
+                action=str(detail["action"]),
+                line=str(detail.get("line", "")),
+                tick=int(detail.get("tick", record.tick)),
+                scope=str(detail.get("scope", "")),
+                reason=str(detail.get("reason", "replayed blocked action")),
+            )
+
     def health(self) -> dict[str, Any]:
         """Return the values a health probe needs."""
 
@@ -254,6 +306,7 @@ class PlantRuntime:
             "batches": self.batches.count(),
             "alarms": self.alarms.count(),
             "lines": {line: machine.phase for line, machine in self.machines.items()},
+            "frozen": self.rollbacks.is_open(),
             "latched": {"sampler": self.sampler.latch.latched},
         }
 
@@ -285,6 +338,7 @@ class PlantRuntime:
             alarms=self.alarms.recent(),
             facts=self.view.facts(),
             config=self.config.describe(),
+            rollback=self.rollbacks.describe(),
         )
 
     def records(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -463,6 +517,14 @@ class PlantRuntime:
                 text(payload, "name"), self._detail(payload)
             ),
             "audit.rollup": lambda payload: self.audit.rollup(),
+            "rollback.begin": lambda payload: self.rollback_service.rollback(
+                text(payload, "line"), reason=text(payload, "reason")
+            ),
+            "rollback.realign": lambda payload: self.rollback_service.realign(
+                text(payload, "line"),
+                confirmed_by=text(payload, "confirmed_by"),
+                note=optional_text(payload, "note", "") or None,
+            ),
             "baseline.publish": lambda payload: self.publish_baseline(
                 text(payload, "name"),
                 number(payload, "value"),
@@ -488,6 +550,7 @@ class PlantRuntime:
         handler = self.commands().get(command)
         if handler is None:
             raise NotFoundError("unknown command", command=command)
+        self._guard_freeze(command)
         result = handler(payload or {})
         return {
             "command": command,
@@ -496,6 +559,30 @@ class PlantRuntime:
             "watermark": self.store.watermark().describe(),
             "alarms": self.alarms.count(),
         }
+
+    def _guard_freeze(self, command: str) -> None:
+        """Refuse a governed command while a covering rollback freeze is open.
+
+        The guard runs before the handler so a blocked action never mutates
+        state or appends a domain record; the attempt itself is appended to the
+        audit trail so blocked actions keep their tick order.
+        """
+
+        episode = self.rollbacks.episode_for_action(command)
+        if episode is None:
+            return
+        blocked = self.rollback_service.record_blocked(
+            action=command, tick=self.clock.now()
+        )
+        raise RollbackFrozenError(
+            f"the {episode.line} line is rolled back to {episode.to_phase} "
+            "and frozen until it is realigned",
+            action=command,
+            line=episode.line,
+            scope=episode.scope,
+            to_phase=episode.to_phase,
+            blocked=blocked,
+        )
 
     def close(self) -> None:
         self.store.close()

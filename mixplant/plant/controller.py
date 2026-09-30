@@ -50,6 +50,7 @@ class PlantController:
             "alarms": self.runtime.alarms.recent(),
             "audit": self.runtime.audit.recent(),
             "counts": self.runtime.audit.counts(),
+            "rollback": self.runtime.rollback_service.status(),
         }
 
     def manifest(self) -> dict[str, Any]:

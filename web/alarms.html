@@ -16,6 +16,29 @@
 <body>
   <nav><a href="/pages/recipe">recipe</a><a href="/pages/batch">batch</a><a href="/pages/discharge">discharge</a><a href="/pages/alarms">alarms</a></nav>
   <h1>Alarms and audit</h1>
+
+  <h2>Stage rollback</h2>
+  <form id="rollback-begin">
+    <select name="line">
+      <option value="batch">batch</option>
+      <option value="mix" selected>mix</option>
+      <option value="delivery">delivery</option>
+    </select>
+    <input name="reason" value="" placeholder="reason (required)" size="40">
+    <button type="submit">roll back to previous stable stage</button>
+  </form>
+  <form id="rollback-realign">
+    <select name="line">
+      <option value="batch">batch</option>
+      <option value="mix" selected>mix</option>
+      <option value="delivery">delivery</option>
+    </select>
+    <input name="confirmed_by" value="" placeholder="confirmed by (required)" size="24">
+    <input name="note" value="" placeholder="note" size="32">
+    <button type="submit">confirm realignment</button>
+  </form>
+  <table id="rollbacks"><thead><tr><th>id</th><th>line</th><th>from</th><th>to</th><th>scope</th><th>state</th><th>reason / confirmed by</th></tr></thead><tbody></tbody></table>
+
   <form id="note"><input name="name" value="shift.note"><input name="detail" value="checked"><button type="submit">note</button></form>
   <form id="rollup"><button type="submit">production roll-up</button></form>
   <form id="baseline"><input name="name" value="scale.factor"><input name="value" value="1.002"><input name="unit" value="x"><button type="submit">publish baseline</button></form>
@@ -37,12 +60,30 @@
       row.innerHTML = `<td>${entry.name}</td><td>${entry.origin}</td><td>${entry.tick}</td>`;
       audit.appendChild(row);
     }
+    const rollbacks = document.querySelector('#rollbacks tbody');
+    const rollback = state.rollback || { registry: { episodes: [] } };
+    for (const ep of (rollback.registry ? rollback.registry.episodes : [])) {
+      const row = document.createElement('tr');
+      row.style.color = ep.realigned_tick === null ? '#a3260b' : '';
+      const who = ep.realigned_tick === null ? ep.reason : `${ep.confirmed_by || ''} (${ep.realign_note || 'realigned'})`;
+      row.innerHTML = `<td>${ep.rollback_id}</td><td>${ep.line}</td><td>${ep.from_phase}</td>`
+        + `<td>${ep.to_phase}</td><td>${ep.scope}</td>`
+        + `<td>${ep.realigned_tick === null ? 'FROZEN' : 'realigned @' + ep.realigned_tick}</td>`
+        + `<td>${who}</td>`;
+      rollbacks.appendChild(row);
+    }
     async function post(path, form) {
       const entries = form ? Object.fromEntries(new FormData(form).entries()) : {};
       const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entries) });
       return response.json();
     }
-    const routes = { note: '/api/audit/note', rollup: '/api/audit/rollup', baseline: '/api/baseline' };
+    const routes = {
+      note: '/api/audit/note',
+      rollup: '/api/audit/rollup',
+      baseline: '/api/baseline',
+      'rollback-begin': '/api/rollback/begin',
+      'rollback-realign': '/api/rollback/realign',
+    };
     for (const [id, path] of Object.entries(routes)) {
       document.getElementById(id).addEventListener('submit', async (event) => { event.preventDefault(); console.log(await post(path, event.target)); location.reload(); });
     }

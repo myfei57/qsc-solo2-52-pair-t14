@@ -19,6 +19,7 @@ def compose_plant_status(
     alarms: list[dict[str, Any]],
     facts: Mapping[str, bool],
     config: Mapping[str, Any],
+    rollback: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Fold every subsystem view into the document the console serves."""
 
@@ -35,4 +36,5 @@ def compose_plant_status(
         "alarms": list(alarms),
         "facts": dict(facts),
         "config": dict(config),
+        "rollback": dict(rollback or {"frozen": False, "open": [], "episodes": []}),
     }

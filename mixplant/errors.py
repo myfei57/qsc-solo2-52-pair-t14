@@ -52,6 +52,13 @@ class InterlockBlockedError(MixPlantError):
     http_status = 409
 
 
+class RollbackFrozenError(MixPlantError):
+    """A rollback is holding the line frozen until it is realigned."""
+
+    code = "rollback_frozen"
+    http_status = 409
+
+
 class ArtifactExpiredError(MixPlantError):
     """A confirmation, snapshot or baseline is past its validity window."""
 
